@@ -66,11 +66,21 @@ struct vmsvga_softc {
 	bus_addr_t		 fb_pa;
 	bus_size_t		 fb_size;
 
-	/* BAR2 -- FIFO command ring. */
+	/*
+	 * FIFO command ring.  On classic SVGA-II this is a separate
+	 * memory BAR (typically BAR2).  On VBox arm64 there is no
+	 * second BAR -- the FIFO physical address lives at
+	 * SVGA_REG_MEM_START and falls inside BAR0's MMIO window, so
+	 * we reuse reg_bst/reg_bsh with an offset.  fifo_offset is
+	 * the byte offset from reg_bsh; fifo_res != NULL means we
+	 * had a dedicated BAR (classic path).
+	 */
 	int			 fifo_rid;
 	struct resource		*fifo_res;
+	bus_size_t		 fifo_offset;	/* offset inside reg_bsh */
 	bus_size_t		 fifo_size;
-	uint32_t volatile	*fifo;		/* virtual mapping */
+	uint32_t		 fifo_pa;	/* SVGA_REG_MEM_START */
+	bool			 fifo_ready;
 
 	/* Negotiated SVGA state. */
 	uint32_t		 svga_id;
@@ -79,6 +89,18 @@ struct vmsvga_softc {
 	uint32_t		 max_height;
 	uint32_t		 host_bpp;
 	uint32_t		 vram_size;
+
+	/* Current programmed mode (Phase B sanity test). */
+	uint32_t		 cur_width;
+	uint32_t		 cur_height;
+	uint32_t		 cur_bpp;
+	uint32_t		 cur_bytes_per_line;
+	uint32_t		 cur_enable;
+
+	/* Phase B sysctl trigger knobs. */
+	uint32_t		 want_width;
+	uint32_t		 want_height;
+	uint32_t		 want_bpp;
 };
 
 /* ---------- low-level SVGA register access ----------
@@ -121,6 +143,206 @@ vmsvga_write_reg(struct vmsvga_softc *sc, uint16_t reg, uint32_t val)
 	}
 	bus_space_write_4(sc->reg_bst, sc->reg_bsh,
 	    (bus_size_t)reg * 4, val);
+}
+
+/* ---------- FIFO access ----------
+ *
+ * The command FIFO is a 32-bit ring buffer with a fixed 4-word
+ * header (MIN, MAX, NEXT_CMD, STOP) followed by the command
+ * payload area.
+ *
+ *    fifo[SVGA_FIFO_MIN]      = first byte offset of payload
+ *    fifo[SVGA_FIFO_MAX]      = byte offset just past last byte
+ *    fifo[SVGA_FIFO_NEXT_CMD] = byte offset where guest writes next
+ *    fifo[SVGA_FIFO_STOP]     = byte offset host has consumed up to
+ *
+ * All offsets are byte offsets from fifo[0].  Producer writes
+ * commands at NEXT_CMD, advancing it (wrapping at MAX back to
+ * MIN).  Consumer (host) advances STOP.
+ */
+
+static inline uint32_t
+vmsvga_fifo_read(struct vmsvga_softc *sc, uint32_t word_off)
+{
+	return (bus_space_read_4(sc->reg_bst, sc->reg_bsh,
+	    sc->fifo_offset + word_off * 4));
+}
+
+static inline void
+vmsvga_fifo_write(struct vmsvga_softc *sc, uint32_t word_off, uint32_t val)
+{
+	bus_space_write_4(sc->reg_bst, sc->reg_bsh,
+	    sc->fifo_offset + word_off * 4, val);
+}
+
+static int
+vmsvga_fifo_init(struct vmsvga_softc *sc)
+{
+	uint32_t header_size;
+
+	sc->fifo_pa   = vmsvga_read_reg(sc, SVGA_REG_MEM_START);
+	sc->fifo_size = vmsvga_read_reg(sc, SVGA_REG_MEM_SIZE);
+	if (sc->fifo_pa == 0 || sc->fifo_size == 0) {
+		device_printf(sc->dev,
+		    "FIFO disabled by host (mem_start=0x%08x mem_size=%lu)\n",
+		    sc->fifo_pa, (unsigned long)sc->fifo_size);
+		return (ENXIO);
+	}
+
+	/*
+	 * The FIFO physical address must lie inside BAR0 (the only
+	 * MMIO window we mapped on VBox arm64).  Translate to a
+	 * byte offset from reg_bsh.
+	 */
+	if (sc->fifo_res != NULL) {
+		/* Classic path: we already mapped a dedicated FIFO BAR.
+		 * fifo_offset stays 0 in that branch; nothing more to do. */
+	} else {
+		bus_addr_t reg_start = rman_get_start(sc->reg_res);
+		bus_size_t reg_size  = rman_get_size(sc->reg_res);
+
+		if (sc->fifo_pa < reg_start ||
+		    sc->fifo_pa + sc->fifo_size > reg_start + reg_size) {
+			device_printf(sc->dev,
+			    "FIFO at 0x%08x size %lu is outside BAR0 "
+			    "(0x%jx +%ju); cannot map\n",
+			    sc->fifo_pa, (unsigned long)sc->fifo_size,
+			    (uintmax_t)reg_start, (uintmax_t)reg_size);
+			return (ENXIO);
+		}
+		sc->fifo_offset = sc->fifo_pa - reg_start;
+	}
+
+	/*
+	 * Initialise the FIFO header.  MIN is the first byte after
+	 * the header; MAX is the total ring size; NEXT_CMD and STOP
+	 * both start at MIN (empty ring).
+	 */
+	header_size = SVGA_FIFO_NUM_REGS * 4;
+	vmsvga_fifo_write(sc, SVGA_FIFO_MIN,      header_size);
+	vmsvga_fifo_write(sc, SVGA_FIFO_MAX,      sc->fifo_size);
+	vmsvga_fifo_write(sc, SVGA_FIFO_NEXT_CMD, header_size);
+	vmsvga_fifo_write(sc, SVGA_FIFO_STOP,     header_size);
+
+	/* CONFIG_DONE = 1 hands the FIFO over to the host. */
+	vmsvga_write_reg(sc, SVGA_REG_CONFIG_DONE, 1);
+	sc->fifo_ready = true;
+
+	device_printf(sc->dev,
+	    "FIFO ready pa=0x%08x size=%lu offset_in_BAR0=0x%jx "
+	    "(MIN=%u MAX=%u NEXT=%u STOP=%u)\n",
+	    sc->fifo_pa, (unsigned long)sc->fifo_size,
+	    (uintmax_t)sc->fifo_offset,
+	    vmsvga_fifo_read(sc, SVGA_FIFO_MIN),
+	    vmsvga_fifo_read(sc, SVGA_FIFO_MAX),
+	    vmsvga_fifo_read(sc, SVGA_FIFO_NEXT_CMD),
+	    vmsvga_fifo_read(sc, SVGA_FIFO_STOP));
+	return (0);
+}
+
+/*
+ * Wait for host to drain enough FIFO room for one more dword.
+ * In real life this would poll SVGA_REG_BUSY / wait on FENCE.
+ * For Phase B we just spin a few times.
+ */
+static int
+vmsvga_fifo_reserve(struct vmsvga_softc *sc, uint32_t bytes)
+{
+	uint32_t min, max, next, stop, free;
+	int spins;
+
+	min = vmsvga_fifo_read(sc, SVGA_FIFO_MIN);
+	max = vmsvga_fifo_read(sc, SVGA_FIFO_MAX);
+	for (spins = 0; spins < 1000; spins++) {
+		next = vmsvga_fifo_read(sc, SVGA_FIFO_NEXT_CMD);
+		stop = vmsvga_fifo_read(sc, SVGA_FIFO_STOP);
+		if (next >= stop)
+			free = (max - next) + (stop - min);
+		else
+			free = stop - next;
+		if (free > bytes)
+			return (0);
+		/* Kick the host. */
+		vmsvga_write_reg(sc, SVGA_REG_SYNC, 1);
+		(void)vmsvga_read_reg(sc, SVGA_REG_BUSY);
+		DELAY(100);
+	}
+	return (EBUSY);
+}
+
+static void
+vmsvga_fifo_push(struct vmsvga_softc *sc, uint32_t dword)
+{
+	uint32_t min, max, next;
+
+	min  = vmsvga_fifo_read(sc, SVGA_FIFO_MIN);
+	max  = vmsvga_fifo_read(sc, SVGA_FIFO_MAX);
+	next = vmsvga_fifo_read(sc, SVGA_FIFO_NEXT_CMD);
+
+	bus_space_write_4(sc->reg_bst, sc->reg_bsh,
+	    sc->fifo_offset + next, dword);
+	next += 4;
+	if (next == max)
+		next = min;
+	vmsvga_fifo_write(sc, SVGA_FIFO_NEXT_CMD, next);
+}
+
+static int
+vmsvga_fifo_emit_update(struct vmsvga_softc *sc,
+    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	int err;
+
+	if (!sc->fifo_ready)
+		return (ENXIO);
+	err = vmsvga_fifo_reserve(sc, 5 * 4);
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "FIFO reserve timeout\n");
+		return (err);
+	}
+	vmsvga_fifo_push(sc, SVGA_CMD_UPDATE);
+	vmsvga_fifo_push(sc, x);
+	vmsvga_fifo_push(sc, y);
+	vmsvga_fifo_push(sc, w);
+	vmsvga_fifo_push(sc, h);
+	/* Kick. */
+	vmsvga_write_reg(sc, SVGA_REG_SYNC, 1);
+	(void)vmsvga_read_reg(sc, SVGA_REG_BUSY);
+	return (0);
+}
+
+/* ---------- mode set ---------- */
+
+static int
+vmsvga_set_mode(struct vmsvga_softc *sc, uint32_t w, uint32_t h, uint32_t bpp)
+{
+	if (w == 0 || h == 0)
+		return (EINVAL);
+	if (w > sc->max_width || h > sc->max_height)
+		return (EINVAL);
+	if (bpp != 32 && bpp != 24 && bpp != 16)
+		return (EINVAL);
+
+	vmsvga_write_reg(sc, SVGA_REG_ENABLE,         0);
+	vmsvga_write_reg(sc, SVGA_REG_WIDTH,          w);
+	vmsvga_write_reg(sc, SVGA_REG_HEIGHT,         h);
+	vmsvga_write_reg(sc, SVGA_REG_BITS_PER_PIXEL, bpp);
+	vmsvga_write_reg(sc, SVGA_REG_ENABLE,         1);
+
+	sc->cur_width          = vmsvga_read_reg(sc, SVGA_REG_WIDTH);
+	sc->cur_height         = vmsvga_read_reg(sc, SVGA_REG_HEIGHT);
+	sc->cur_bpp            = vmsvga_read_reg(sc, SVGA_REG_BITS_PER_PIXEL);
+	sc->cur_bytes_per_line = vmsvga_read_reg(sc, SVGA_REG_BYTES_PER_LINE);
+	sc->cur_enable         = vmsvga_read_reg(sc, SVGA_REG_ENABLE);
+
+	device_printf(sc->dev,
+	    "mode set %ux%u@%ubpp -> readback %ux%u@%ubpp "
+	    "stride=%u enable=%u\n",
+	    w, h, bpp,
+	    sc->cur_width, sc->cur_height, sc->cur_bpp,
+	    sc->cur_bytes_per_line, sc->cur_enable);
+	return (0);
 }
 
 /* ---------- newbus identify / probe / attach ---------- */
@@ -222,8 +444,6 @@ vmsvga_alloc_resources(struct vmsvga_softc *sc)
 					sc->fifo_res  = sc->fb_res;
 					sc->fifo_rid  = sc->fb_rid;
 					sc->fifo_size = sc->fb_size;
-					sc->fifo      = (uint32_t volatile *)
-					    rman_get_virtual(sc->fifo_res);
 				} else {
 					bus_release_resource(sc->dev,
 					    SYS_RES_MEMORY, sc->fb_rid,
@@ -238,8 +458,6 @@ vmsvga_alloc_resources(struct vmsvga_softc *sc)
 			sc->fifo_res  = r;
 			sc->fifo_rid  = rid;
 			sc->fifo_size = sz;
-			sc->fifo      = (uint32_t volatile *)
-			    rman_get_virtual(r);
 		} else {
 			bus_release_resource(sc->dev, SYS_RES_MEMORY,
 			    rid, r);
@@ -309,6 +527,89 @@ vmsvga_read_hw_info(struct vmsvga_softc *sc)
 	sc->vram_size    = vmsvga_read_reg(sc, SVGA_REG_VRAM_SIZE);
 }
 
+static int
+vmsvga_sysctl_apply_mode(SYSCTL_HANDLER_ARGS)
+{
+	struct vmsvga_softc *sc = arg1;
+	int val = 0, err;
+
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (val != 1)
+		return (EINVAL);
+	return (vmsvga_set_mode(sc, sc->want_width, sc->want_height,
+	    sc->want_bpp));
+}
+
+static int
+vmsvga_sysctl_diag(SYSCTL_HANDLER_ARGS)
+{
+	struct vmsvga_softc *sc = arg1;
+	int val = 0, err;
+
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (val != 1)
+		return (EINVAL);
+
+	device_printf(sc->dev,
+	    "diag: reg_res bushandle=0x%jx virtual=%p type=%s\n",
+	    (uintmax_t)rman_get_bushandle(sc->reg_res),
+	    rman_get_virtual(sc->reg_res),
+	    sc->reg_type == SYS_RES_IOPORT ? "ioport" : "memory");
+	device_printf(sc->dev,
+	    "diag: fb_res  bushandle=0x%jx virtual=%p start=0x%jx "
+	    "size=%ju\n",
+	    (uintmax_t)rman_get_bushandle(sc->fb_res),
+	    rman_get_virtual(sc->fb_res),
+	    (uintmax_t)rman_get_start(sc->fb_res),
+	    (uintmax_t)rman_get_size(sc->fb_res));
+	if (sc->fifo_res != NULL) {
+		device_printf(sc->dev,
+		    "diag: fifo_res bushandle=0x%jx virtual=%p size=%ju\n",
+		    (uintmax_t)rman_get_bushandle(sc->fifo_res),
+		    rman_get_virtual(sc->fifo_res),
+		    (uintmax_t)rman_get_size(sc->fifo_res));
+	}
+	device_printf(sc->dev,
+	    "diag: SVGA_REG_FB_START=0x%08x FB_OFFSET=0x%08x "
+	    "FB_SIZE=%u BYTES_PER_LINE=%u\n",
+	    vmsvga_read_reg(sc, SVGA_REG_FB_START),
+	    vmsvga_read_reg(sc, SVGA_REG_FB_OFFSET),
+	    vmsvga_read_reg(sc, SVGA_REG_FB_SIZE),
+	    vmsvga_read_reg(sc, SVGA_REG_BYTES_PER_LINE));
+	device_printf(sc->dev,
+	    "diag: SVGA_REG_VRAM_SIZE=%u MEM_START=0x%08x MEM_SIZE=%u "
+	    "ENABLE=%u BUSY=%u\n",
+	    vmsvga_read_reg(sc, SVGA_REG_VRAM_SIZE),
+	    vmsvga_read_reg(sc, SVGA_REG_MEM_START),
+	    vmsvga_read_reg(sc, SVGA_REG_MEM_SIZE),
+	    vmsvga_read_reg(sc, SVGA_REG_ENABLE),
+	    vmsvga_read_reg(sc, SVGA_REG_BUSY));
+	return (0);
+}
+
+/*
+ * NOTE: test_update was removed in Phase B v3.  Direct FB BAR
+ * writes via bus_space_write_4 panic the guest on VBox arm64
+ * even though diag() shows the BAR is kva-mapped with a sane
+ * bushandle (0xffff0000aa600000) and the host reports
+ * SVGA_REG_FB_START=0x88000000 / FB_SIZE=3MB / ENABLE=1.
+ *
+ * Hypothesis: VBox arm64's SVGA-II emulation does not back the
+ * VRAM BAR with writable guest memory.  Reads "work" only because
+ * any read returns 0; writes trigger a hypervisor decode that
+ * cannot resolve to anything and takes the guest down.
+ *
+ * Path forward (Phase C): allocate dumb buffers in guest RAM and
+ * tell the host where they live via SVGA_CMD_DEFINE_SCREEN /
+ * Screen Object 2 (caps bit 0x800000 IS set on this host).  This
+ * mirrors how modern vmwgfx works and sidesteps the FB BAR
+ * entirely.
+ */
+
 static void
 vmsvga_sysctl_setup(struct vmsvga_softc *sc)
 {
@@ -334,6 +635,43 @@ vmsvga_sysctl_setup(struct vmsvga_softc *sc)
 	    CTLFLAG_RD, &sc->host_bpp, 0, "Host bits-per-pixel");
 	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "vram_size",
 	    CTLFLAG_RD, &sc->vram_size, 0, "VRAM size in bytes");
+
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "fifo_pa",
+	    CTLFLAG_RD, &sc->fifo_pa, 0,
+	    "FIFO physical base (SVGA_REG_MEM_START)");
+	SYSCTL_ADD_OPAQUE(ctx, children, OID_AUTO, "fifo_size",
+	    CTLFLAG_RD, &sc->fifo_size, sizeof(sc->fifo_size), "LU",
+	    "FIFO size in bytes (SVGA_REG_MEM_SIZE)");
+
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "cur_width",
+	    CTLFLAG_RD, &sc->cur_width, 0, "Currently programmed width");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "cur_height",
+	    CTLFLAG_RD, &sc->cur_height, 0, "Currently programmed height");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "cur_bpp",
+	    CTLFLAG_RD, &sc->cur_bpp, 0, "Currently programmed bpp");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "cur_bytes_per_line",
+	    CTLFLAG_RD, &sc->cur_bytes_per_line, 0, "Stride in bytes");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "cur_enable",
+	    CTLFLAG_RD, &sc->cur_enable, 0, "Scanout enabled");
+
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "want_width",
+	    CTLFLAG_RW, &sc->want_width, 0,
+	    "Requested width for next apply_mode");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "want_height",
+	    CTLFLAG_RW, &sc->want_height, 0,
+	    "Requested height for next apply_mode");
+	SYSCTL_ADD_UINT(ctx, children, OID_AUTO, "want_bpp",
+	    CTLFLAG_RW, &sc->want_bpp, 0,
+	    "Requested bpp for next apply_mode");
+
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "apply_mode",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    vmsvga_sysctl_apply_mode, "I",
+	    "Write 1 to apply want_width x want_height @ want_bpp");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "diag",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    vmsvga_sysctl_diag, "I",
+	    "Write 1 to dump BAR mappings + live SVGA reg state");
 }
 
 static int
@@ -356,18 +694,24 @@ vmsvga_attach(device_t dev)
 		goto fail;
 
 	vmsvga_read_hw_info(sc);
+
+	sc->want_width  = 1024;
+	sc->want_height = 768;
+	sc->want_bpp    = 32;
+
+	(void)vmsvga_fifo_init(sc);	/* not fatal -- some hosts gate */
+
 	vmsvga_sysctl_setup(sc);
 
 	device_printf(dev,
 	    "SVGA-II id=0x%08x caps=0x%08x max=%ux%u host_bpp=%u "
-	    "vram=%u bytes fifo=%lu bytes (reg BAR=%s, fb_pa=0x%jx, "
-	    "fifo BAR=%s)\n",
+	    "vram=%u bytes (reg BAR=%s, fb_pa=0x%jx, fifo=%s)\n",
 	    sc->svga_id, sc->capabilities,
 	    sc->max_width, sc->max_height, sc->host_bpp,
-	    sc->vram_size, (unsigned long)sc->fifo_size,
+	    sc->vram_size,
 	    sc->reg_type == SYS_RES_IOPORT ? "ioport" : "memory",
 	    (uintmax_t)sc->fb_pa,
-	    sc->fifo_res != NULL ? "present" : "absent");
+	    sc->fifo_ready ? "ready" : "unavailable");
 
 	return (0);
 fail:
