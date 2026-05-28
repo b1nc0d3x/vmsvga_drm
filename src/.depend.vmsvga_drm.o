@@ -1,0 +1,36 @@
+vmsvga_drm.o: vmsvga_drm.c /home/b1nc0d3x/vmsvga_drm/src/opt_global.h \
+  /usr/src/sys/sys/param.h /usr/src/sys/sys/_null.h \
+  /usr/src/sys/sys/_param.h /usr/src/sys/sys/types.h \
+  /usr/src/sys/sys/cdefs.h /usr/src/sys/sys/_visible.h machine/endian.h \
+  /usr/src/sys/sys/_types.h machine/_types.h /usr/src/sys/sys/_endian.h \
+  /usr/src/sys/sys/_pthreadtypes.h /usr/src/sys/sys/_stdint.h \
+  /usr/src/sys/sys/bitcount.h /usr/src/sys/sys/select.h \
+  /usr/src/sys/sys/_sigset.h /usr/src/sys/sys/_timeval.h \
+  /usr/src/sys/sys/timespec.h /usr/src/sys/sys/_timespec.h \
+  /usr/src/sys/sys/syslimits.h /usr/src/sys/sys/errno.h \
+  /usr/src/sys/sys/time.h /usr/src/sys/sys/_clock_id.h \
+  /usr/src/sys/sys/priority.h machine/param.h machine/_align.h \
+  /usr/src/sys/sys/bus.h machine/_limits.h machine/_bus.h \
+  /usr/src/sys/sys/_bus_dma.h /usr/src/sys/sys/ioccom.h \
+  /usr/src/sys/sys/_eventhandler.h /usr/src/sys/sys/queue.h \
+  /usr/src/sys/sys/kobj.h /usr/src/sys/sys/systm.h \
+  /usr/src/sys/sys/callout.h /usr/src/sys/sys/_callout.h \
+  /usr/src/sys/sys/kassert.h /usr/src/sys/sys/stdint.h machine/_stdint.h \
+  machine/atomic.h /usr/src/sys/sys/atomic_common.h machine/cpufunc.h \
+  machine/armreg.h /usr/src/sys/sys/pcpu.h /usr/src/sys/sys/_cpuset.h \
+  /usr/src/sys/sys/_bitset.h /usr/src/sys/sys/_lock.h \
+  /usr/src/sys/sys/_mutex.h /usr/src/sys/sys/_sx.h \
+  /usr/src/sys/sys/_rmlock.h /usr/src/sys/sys/resource.h machine/pcpu.h \
+  machine/cpu.h machine/frame.h /usr/src/sys/sys/signal.h \
+  /usr/src/sys/sys/_sigaltstack.h /usr/src/sys/sys/_sigval.h \
+  machine/signal.h /usr/src/sys/sys/ucontext.h machine/ucontext.h \
+  /usr/src/sys/sys/_ucontext.h machine/pcpu_aux.h \
+  /usr/src/sys/sys/kpilite.h /usr/src/sys/sys/libkern.h \
+  /usr/src/sys/sys/devctl.h device_if.h /usr/src/sys/sys/tslog.h \
+  bus_if.h /usr/src/sys/sys/kernel.h /usr/src/sys/sys/linker_set.h \
+  /usr/src/sys/sys/malloc.h /usr/src/sys/sys/module.h \
+  /usr/src/sys/sys/rman.h machine/resource.h /usr/src/sys/sys/sysctl.h \
+  /usr/src/sys/sys/tree.h machine/bus.h machine/bus_dma.h \
+  /usr/src/sys/sys/bus_dma.h machine/bus_dma_impl.h \
+  /usr/src/sys/dev/pci/pcireg.h /usr/src/sys/dev/pci/pcivar.h pci_if.h \
+  vmsvga_reg.h
