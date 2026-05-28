@@ -41,6 +41,10 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
+#include <dev/drm2/drmP.h>
+#include <dev/drm2/drm_crtc.h>
+#include <dev/drm2/drm_crtc_helper.h>
+
 #include "vmsvga_reg.h"
 
 #define	VMSVGA_DRM_DRIVER_NAME	"vmsvga_drm"
@@ -101,6 +105,12 @@ struct vmsvga_softc {
 	uint32_t		 want_width;
 	uint32_t		 want_height;
 	uint32_t		 want_bpp;
+
+	/* Phase C: DRM-KMS scaffold. */
+	struct drm_device	*drm_dev;
+	struct drm_crtc		 crtc;
+	struct drm_encoder	 encoder;
+	struct drm_connector	 connector;
 };
 
 /* ---------- low-level SVGA register access ----------
@@ -344,6 +354,323 @@ vmsvga_set_mode(struct vmsvga_softc *sc, uint32_t w, uint32_t h, uint32_t bpp)
 	    sc->cur_bytes_per_line, sc->cur_enable);
 	return (0);
 }
+
+/* ====================================================================
+ * Phase C -- DRM-KMS scaffold
+ *
+ * Goal: /dev/dri/card0 appears, modeset ioctls work, dumb buffers
+ * land in guest RAM (never the FB BAR -- Phase B proved writing
+ * the BAR panics VBox arm64).  Real pixel display deferred to a
+ * later phase that goes via SVGA_CMD_DEFINE_SCREEN_OBJECT_v2.
+ *
+ * Single head: one CRTC, one virtual encoder, one virtual
+ * connector that always reports "connected" with a fixed mode
+ * range up to max_width x max_height.
+ * ==================================================================== */
+
+/* ---- framebuffer funcs (stub: handle-only, no host transfer yet) ---- */
+
+static void
+vmsvga_drm_fb_destroy(struct drm_framebuffer *fb)
+{
+	drm_framebuffer_cleanup(fb);
+	free(fb, M_DEVBUF);
+}
+
+static int
+vmsvga_drm_fb_create_handle(struct drm_framebuffer *fb,
+    struct drm_file *file_priv, unsigned int *handle)
+{
+	return (-ENODEV);	/* dumb_create handles GEM in Phase C.2 */
+}
+
+static const struct drm_framebuffer_funcs vmsvga_drm_fb_funcs = {
+	.destroy	= vmsvga_drm_fb_destroy,
+	.create_handle	= vmsvga_drm_fb_create_handle,
+};
+
+static int
+vmsvga_drm_fb_create(struct drm_device *ddev, struct drm_file *file,
+    struct drm_mode_fb_cmd2 *mode_cmd, struct drm_framebuffer **fb_out)
+{
+	struct drm_framebuffer *fb;
+	int ret;
+
+	fb = malloc(sizeof(*fb), M_DEVBUF, M_WAITOK | M_ZERO);
+	ret = drm_framebuffer_init(ddev, fb, &vmsvga_drm_fb_funcs);
+	if (ret != 0) {
+		free(fb, M_DEVBUF);
+		return (ret);
+	}
+	fb->width  = mode_cmd->width;
+	fb->height = mode_cmd->height;
+	fb->pitches[0] = mode_cmd->pitches[0];
+	fb->offsets[0] = mode_cmd->offsets[0];
+	fb->depth      = 24;
+	fb->bits_per_pixel = 32;
+	*fb_out = fb;
+	return (0);
+}
+
+static void
+vmsvga_drm_output_poll_changed(struct drm_device *ddev)
+{
+}
+
+static const struct drm_mode_config_funcs vmsvga_drm_mode_config_funcs = {
+	.fb_create		= vmsvga_drm_fb_create,
+	.output_poll_changed	= vmsvga_drm_output_poll_changed,
+};
+
+/* ---- CRTC (one for now) ---- */
+
+static void
+vmsvga_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
+{
+}
+
+static bool
+vmsvga_drm_crtc_mode_fixup(struct drm_crtc *crtc,
+    const struct drm_display_mode *mode,
+    struct drm_display_mode *adjusted_mode)
+{
+	return (true);
+}
+
+static int
+vmsvga_drm_crtc_mode_set(struct drm_crtc *crtc,
+    struct drm_display_mode *mode, struct drm_display_mode *adjusted,
+    int x, int y, struct drm_framebuffer *old_fb)
+{
+	struct vmsvga_softc *sc =
+	    __containerof(crtc, struct vmsvga_softc, crtc);
+
+	/* Mode-set side: write the SVGA registers (proven path). */
+	return (vmsvga_set_mode(sc, mode->hdisplay, mode->vdisplay, 32));
+}
+
+static int
+vmsvga_drm_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
+    struct drm_framebuffer *old_fb)
+{
+	return (0);
+}
+
+static void
+vmsvga_drm_crtc_prepare(struct drm_crtc *crtc) { }
+static void
+vmsvga_drm_crtc_commit(struct drm_crtc *crtc)  { }
+
+static void
+vmsvga_drm_crtc_gamma_set(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
+    uint32_t start, uint32_t size)
+{
+}
+
+static int
+vmsvga_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+    struct drm_pending_vblank_event *event)
+{
+	return (-ENOSYS);	/* page flips need Phase D's GMR plumbing */
+}
+
+static void
+vmsvga_drm_crtc_destroy(struct drm_crtc *crtc)
+{
+	drm_crtc_cleanup(crtc);
+}
+
+static const struct drm_crtc_funcs vmsvga_drm_crtc_funcs = {
+	.gamma_set	= vmsvga_drm_crtc_gamma_set,
+	.set_config	= drm_crtc_helper_set_config,
+	.destroy	= vmsvga_drm_crtc_destroy,
+	.page_flip	= vmsvga_drm_crtc_page_flip,
+};
+
+static const struct drm_crtc_helper_funcs vmsvga_drm_crtc_helper_funcs = {
+	.dpms		= vmsvga_drm_crtc_dpms,
+	.mode_fixup	= vmsvga_drm_crtc_mode_fixup,
+	.mode_set	= vmsvga_drm_crtc_mode_set,
+	.mode_set_base	= vmsvga_drm_crtc_mode_set_base,
+	.prepare	= vmsvga_drm_crtc_prepare,
+	.commit		= vmsvga_drm_crtc_commit,
+};
+
+/* ---- encoder ---- */
+
+static bool
+vmsvga_drm_encoder_mode_fixup(struct drm_encoder *e,
+    const struct drm_display_mode *m,
+    struct drm_display_mode *am)
+{
+	return (true);
+}
+
+static void
+vmsvga_drm_encoder_mode_set(struct drm_encoder *e,
+    struct drm_display_mode *m, struct drm_display_mode *am) { }
+
+static void
+vmsvga_drm_encoder_dpms(struct drm_encoder *e, int s) { }
+static void
+vmsvga_drm_encoder_prepare(struct drm_encoder *e)     { }
+static void
+vmsvga_drm_encoder_commit(struct drm_encoder *e)      { }
+
+static void
+vmsvga_drm_encoder_destroy(struct drm_encoder *e)
+{
+	drm_encoder_cleanup(e);
+}
+
+static const struct drm_encoder_funcs vmsvga_drm_encoder_funcs = {
+	.destroy	= vmsvga_drm_encoder_destroy,
+};
+
+static const struct drm_encoder_helper_funcs
+    vmsvga_drm_encoder_helper_funcs = {
+	.dpms		= vmsvga_drm_encoder_dpms,
+	.mode_fixup	= vmsvga_drm_encoder_mode_fixup,
+	.mode_set	= vmsvga_drm_encoder_mode_set,
+	.prepare	= vmsvga_drm_encoder_prepare,
+	.commit		= vmsvga_drm_encoder_commit,
+};
+
+/* ---- virtual connector ---- */
+
+static int
+vmsvga_drm_connector_get_modes(struct drm_connector *conn)
+{
+	struct vmsvga_softc *sc =
+	    __containerof(conn, struct vmsvga_softc, connector);
+	struct drm_display_mode *mode;
+	int count;
+
+	count = drm_add_modes_noedid(conn, sc->max_width, sc->max_height);
+
+	/* Mark a 1024x768 mode as preferred if the list contains one. */
+	list_for_each_entry(mode, &conn->probed_modes, head) {
+		if (mode->hdisplay == 1024 && mode->vdisplay == 768) {
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+			break;
+		}
+	}
+	return (count);
+}
+
+static int
+vmsvga_drm_connector_mode_valid(struct drm_connector *conn,
+    struct drm_display_mode *mode)
+{
+	struct vmsvga_softc *sc =
+	    __containerof(conn, struct vmsvga_softc, connector);
+
+	if (mode->hdisplay > sc->max_width ||
+	    mode->vdisplay > sc->max_height)
+		return (MODE_BAD);
+	return (MODE_OK);
+}
+
+static struct drm_encoder *
+vmsvga_drm_connector_best_encoder(struct drm_connector *conn)
+{
+	struct vmsvga_softc *sc =
+	    __containerof(conn, struct vmsvga_softc, connector);
+
+	/* Single-head: encoder is right next to the connector in the softc. */
+	return (&sc->encoder);
+}
+
+static enum drm_connector_status
+vmsvga_drm_connector_detect(struct drm_connector *conn, bool force)
+{
+	return (connector_status_connected);
+}
+
+static void
+vmsvga_drm_connector_destroy(struct drm_connector *conn)
+{
+	drm_connector_cleanup(conn);
+}
+
+static const struct drm_connector_helper_funcs
+    vmsvga_drm_connector_helper_funcs = {
+	.get_modes	= vmsvga_drm_connector_get_modes,
+	.mode_valid	= vmsvga_drm_connector_mode_valid,
+	.best_encoder	= vmsvga_drm_connector_best_encoder,
+};
+
+static const struct drm_connector_funcs vmsvga_drm_connector_funcs = {
+	.dpms		= drm_helper_connector_dpms,
+	.detect		= vmsvga_drm_connector_detect,
+	.fill_modes	= drm_helper_probe_single_connector_modes,
+	.destroy	= vmsvga_drm_connector_destroy,
+};
+
+/* ---- drm_load / drm_unload ---- */
+
+static int
+vmsvga_drm_load(struct drm_device *ddev, unsigned long flags)
+{
+	struct vmsvga_softc *sc = device_get_softc(ddev->dev);
+
+	device_printf(ddev->dev, "drm_load: step A: mode_config_init\n");
+	drm_mode_config_init(ddev);
+	ddev->mode_config.min_width  = 0;
+	ddev->mode_config.min_height = 0;
+	ddev->mode_config.max_width  = sc->max_width;
+	ddev->mode_config.max_height = sc->max_height;
+	ddev->mode_config.funcs = __DECONST(struct drm_mode_config_funcs *,
+	    &vmsvga_drm_mode_config_funcs);
+
+	device_printf(ddev->dev, "drm_load: step B: crtc_init\n");
+	drm_crtc_init(ddev, &sc->crtc, &vmsvga_drm_crtc_funcs);
+	drm_mode_crtc_set_gamma_size(&sc->crtc, 256);
+	drm_crtc_helper_add(&sc->crtc, &vmsvga_drm_crtc_helper_funcs);
+
+	device_printf(ddev->dev, "drm_load: step C: encoder_init\n");
+	sc->encoder.possible_crtcs = 0x1;
+	drm_encoder_init(ddev, &sc->encoder, &vmsvga_drm_encoder_funcs,
+	    DRM_MODE_ENCODER_VIRTUAL);
+	drm_encoder_helper_add(&sc->encoder,
+	    &vmsvga_drm_encoder_helper_funcs);
+
+	device_printf(ddev->dev, "drm_load: step D: connector_init\n");
+	drm_connector_init(ddev, &sc->connector,
+	    &vmsvga_drm_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
+	drm_connector_helper_add(&sc->connector,
+	    &vmsvga_drm_connector_helper_funcs);
+	drm_mode_connector_attach_encoder(&sc->connector, &sc->encoder);
+	sc->connector.encoder = &sc->encoder;
+
+	device_printf(ddev->dev,
+	    "drm_load: done -- mode_config %ux%u..%ux%u, 1 CRTC ready\n",
+	    ddev->mode_config.min_width, ddev->mode_config.min_height,
+	    ddev->mode_config.max_width, ddev->mode_config.max_height);
+	return (0);
+}
+
+static int
+vmsvga_drm_unload(struct drm_device *ddev)
+{
+	drm_mode_config_cleanup(ddev);
+	return (0);
+}
+
+#ifndef DRIVER_PRIME
+#define DRIVER_PRIME 0
+#endif
+
+static struct drm_driver vmsvga_drm_driver = {
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME,
+	.load		 = vmsvga_drm_load,
+	.unload		 = vmsvga_drm_unload,
+	.name		 = "vmsvga_drm",
+	.desc		 = VMSVGA_DRM_DRIVER_DESC,
+	.date		 = "20260527",
+	.major		 = 0,
+	.minor		 = 1,
+};
 
 /* ---------- newbus identify / probe / attach ---------- */
 
@@ -703,6 +1030,35 @@ vmsvga_attach(device_t dev)
 
 	vmsvga_sysctl_setup(sc);
 
+	/*
+	 * Phase C: register the DRM device.
+	 *
+	 * Critical detail: use drm_get_platform_dev (not _pci_dev) even
+	 * though we attach under vgapci -- drm_get_pci_dev panicked the
+	 * guest immediately, likely because it expects dev->dev to be
+	 * a direct PCI device, not a vgapci child.  drm_get_platform_dev
+	 * just trusts dev->dev and lets drm core fill in the rest.
+	 */
+	{
+		struct drm_device *ddev;
+		int derr;
+
+		ddev = malloc(sizeof(*ddev), M_DEVBUF, M_WAITOK | M_ZERO);
+		derr = drm_get_platform_dev(dev, ddev, &vmsvga_drm_driver);
+		if (derr == 0) {
+			sc->drm_dev = ddev;
+			device_printf(dev,
+			    "drm: registered /dev/dri/card%d\n",
+			    ddev->primary ? ddev->primary->index : 0);
+		} else {
+			free(ddev, M_DEVBUF);
+			device_printf(dev,
+			    "drm: drm_get_platform_dev failed: %d "
+			    "(KERNCONF must include 'device drm2')\n",
+			    derr);
+		}
+	}
+
 	device_printf(dev,
 	    "SVGA-II id=0x%08x caps=0x%08x max=%ux%u host_bpp=%u "
 	    "vram=%u bytes (reg BAR=%s, fb_pa=0x%jx, fifo=%s)\n",
@@ -725,6 +1081,10 @@ vmsvga_detach(device_t dev)
 	struct vmsvga_softc *sc;
 
 	sc = device_get_softc(dev);
+	if (sc->drm_dev != NULL) {
+		drm_put_dev(sc->drm_dev);
+		sc->drm_dev = NULL;
+	}
 	vmsvga_free_resources(sc);
 	return (0);
 }

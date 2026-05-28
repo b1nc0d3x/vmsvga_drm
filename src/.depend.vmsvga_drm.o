@@ -33,4 +33,48 @@ vmsvga_drm.o: vmsvga_drm.c /home/b1nc0d3x/vmsvga_drm/src/opt_global.h \
   /usr/src/sys/sys/tree.h machine/bus.h machine/bus_dma.h \
   /usr/src/sys/sys/bus_dma.h machine/bus_dma_impl.h \
   /usr/src/sys/dev/pci/pcireg.h /usr/src/sys/dev/pci/pcivar.h pci_if.h \
-  vmsvga_reg.h
+  /usr/src/sys/dev/drm2/drmP.h /usr/src/sys/sys/ktr.h \
+  /usr/src/sys/sys/ktr_class.h /usr/src/sys/sys/conf.h \
+  /usr/src/sys/sys/sglist.h /usr/src/sys/sys/refcount.h \
+  /usr/src/sys/sys/stat.h /usr/src/sys/sys/priv.h \
+  /usr/src/sys/sys/proc.h /usr/src/sys/sys/event.h \
+  /usr/src/sys/sys/_exterr.h /usr/src/sys/sys/condvar.h \
+  /usr/src/sys/sys/lock_profile.h /usr/src/sys/sys/osd.h \
+  /usr/src/sys/sys/rtprio.h /usr/src/sys/sys/sigio.h \
+  /usr/src/sys/sys/signalvar.h /usr/src/sys/sys/ucred.h \
+  /usr/src/sys/bsm/audit.h /usr/src/sys/sys/_domainset.h machine/proc.h \
+  /usr/src/sys/sys/limits.h /usr/src/sys/sys/lock.h \
+  /usr/src/sys/sys/fcntl.h /usr/src/sys/sys/uio.h \
+  /usr/src/sys/sys/_iovec.h /usr/src/sys/sys/_uio.h \
+  /usr/src/sys/sys/filio.h /usr/src/sys/sys/rwlock.h \
+  /usr/src/sys/sys/_rwlock.h /usr/src/sys/sys/lockstat.h \
+  /usr/src/sys/sys/sdt.h machine/sdt_machdep.h \
+  /usr/src/sys/sys/selinfo.h /usr/src/sys/sys/poll.h \
+  /usr/src/sys/sys/sbuf.h /usr/src/sys/sys/taskqueue.h \
+  /usr/src/sys/sys/_task.h /usr/src/sys/sys/vmmeter.h \
+  /usr/src/sys/sys/counter.h machine/counter.h \
+  /usr/src/sys/sys/domainset.h /usr/src/sys/sys/bitset.h \
+  /usr/src/sys/vm/vm.h machine/vm.h /usr/src/sys/vm/pmap.h \
+  machine/pmap.h machine/pte.h /usr/src/sys/sys/_pv_entry.h \
+  /usr/src/sys/vm/_vm_radix.h /usr/src/sys/sys/_pctrie.h \
+  /usr/src/sys/vm/vm_extern.h /usr/src/sys/vm/vm_kern.h \
+  /usr/src/sys/vm/vm_map.h /usr/src/sys/sys/sx.h \
+  /usr/src/sys/vm/vm_object.h /usr/src/sys/sys/_blockcount.h \
+  /usr/src/sys/vm/vm_page.h /usr/src/sys/vm/_vm_phys.h machine/vmparam.h \
+  /usr/src/sys/vm/vm_pager.h /usr/src/sys/vm/vm_param.h \
+  /usr/src/sys/vm/vm_phys.h machine/sysarch.h /usr/src/sys/sys/endian.h \
+  /usr/src/sys/sys/mman.h /usr/src/sys/sys/mutex.h \
+  /usr/src/sys/sys/rangelock.h /usr/src/sys/sys/memrange.h \
+  /usr/src/sys/dev/agp/agpvar.h /usr/src/sys/sys/agpio.h \
+  /usr/src/sys/dev/drm2/drm.h /usr/src/sys/dev/drm2/drm_os_freebsd.h \
+  /usr/src/sys/sys/fbio.h /usr/src/sys/sys/eventhandler.h \
+  /usr/src/sys/sys/smp.h /usr/src/sys/sys/cpuset.h \
+  /usr/src/sys/dev/drm2/drm_mode.h /usr/src/sys/dev/drm2/drm_sarea.h \
+  /usr/src/sys/dev/drm2/drm_atomic.h \
+  /usr/src/sys/dev/drm2/drm_linux_list.h \
+  /usr/src/sys/dev/drm2/drm_gem_names.h \
+  /usr/src/sys/dev/drm2/drm_hashtab.h /usr/src/sys/dev/drm2/drm_mm.h \
+  opt_drm.h opt_syscons.h /usr/src/sys/dev/drm2/drm_crtc.h \
+  /usr/src/sys/dev/drm2/drm_fourcc.h /usr/src/sys/dev/drm2/drm_global.h \
+  /usr/src/sys/dev/drm2/drm_mem_util.h \
+  /usr/src/sys/dev/drm2/drm_crtc_helper.h vmsvga_reg.h
