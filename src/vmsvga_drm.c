@@ -32,11 +32,24 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/queue.h>
 #include <sys/rman.h>
+#include <sys/rwlock.h>
 #include <sys/sysctl.h>
+#include <sys/pctrie.h>
+#include <sys/vmem.h>
 
+#include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/resource.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
+#include <vm/vm_param.h>
+#include <vm/vm_phys.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -111,6 +124,32 @@ struct vmsvga_softc {
 	struct drm_crtc		 crtc;
 	struct drm_encoder	 encoder;
 	struct drm_connector	 connector;
+
+	/* Phase C.2: dumb-buffer bookkeeping. */
+	TAILQ_HEAD(, vmsvga_gem_bo) bos;
+	struct mtx		 bos_mtx;
+	uint32_t		 next_resource_id;
+};
+
+/* GEM bo backing one dumb buffer.  All memory is in guest RAM --
+ * we never write the FB BAR on VBox arm64.  Userland mmap and our
+ * kernel-side bo->vbase share the same physical pages via the
+ * cdev_pager (tegra pattern). */
+struct vmsvga_gem_bo {
+	struct drm_gem_object	gem_obj;
+	vm_offset_t		vbase;	/* kernel VA */
+	bus_addr_t		pbase;	/* physaddr of pages[0] */
+	size_t			size;
+	size_t			npages;
+	vm_page_t	       *pages;	/* npages entries */
+	vm_object_t		cdev_pager;
+	uint32_t		resource_id;
+	TAILQ_ENTRY(vmsvga_gem_bo) link;
+};
+
+struct vmsvga_drm_framebuffer {
+	struct drm_framebuffer	base;
+	struct vmsvga_gem_bo   *bo;
 };
 
 /* ---------- low-level SVGA register access ----------
@@ -368,20 +407,245 @@ vmsvga_set_mode(struct vmsvga_softc *sc, uint32_t w, uint32_t h, uint32_t bpp)
  * range up to max_width x max_height.
  * ==================================================================== */
 
-/* ---- framebuffer funcs (stub: handle-only, no host transfer yet) ---- */
+/* ---- GEM dumb buffer + framebuffer ---- */
+
+/*
+ * cdev_pager ops: pages are pre-inserted at dumb_create time, so
+ * cdev_pg_fault should never fire.  ctor/dtor are no-ops.  Same
+ * shape as virtio_drm and tegra.
+ */
+static int
+vmsvga_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, int prot,
+    vm_page_t *mres)
+{
+	return (VM_PAGER_FAIL);
+}
+
+static int
+vmsvga_gem_pager_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
+    vm_ooffset_t foff, struct ucred *cred, u_short *color)
+{
+	if (color != NULL)
+		*color = 0;
+	return (0);
+}
 
 static void
-vmsvga_drm_fb_destroy(struct drm_framebuffer *fb)
+vmsvga_gem_pager_dtor(void *handle)
 {
-	drm_framebuffer_cleanup(fb);
+}
+
+static struct cdev_pager_ops vmsvga_gem_pager_ops = {
+	.cdev_pg_fault	= vmsvga_gem_pager_fault,
+	.cdev_pg_ctor	= vmsvga_gem_pager_ctor,
+	.cdev_pg_dtor	= vmsvga_gem_pager_dtor,
+};
+
+/* drm_driver.gem_free_object */
+static void
+vmsvga_gem_free_object(struct drm_gem_object *gem_obj)
+{
+	struct vmsvga_gem_bo *bo = (struct vmsvga_gem_bo *)gem_obj;
+	struct vmsvga_softc *sc = device_get_softc(gem_obj->dev->dev);
+	size_t i;
+
+	mtx_lock(&sc->bos_mtx);
+	TAILQ_REMOVE(&sc->bos, bo, link);
+	mtx_unlock(&sc->bos_mtx);
+
+	if (bo->cdev_pager != NULL) {
+		vm_object_deallocate(bo->cdev_pager);
+		bo->cdev_pager = NULL;
+	}
+	if (bo->vbase != 0) {
+		pmap_qremove(bo->vbase, bo->npages);
+		vmem_free(kernel_arena, bo->vbase, bo->size);
+	}
+	if (bo->pages != NULL) {
+		for (i = 0; i < bo->npages; i++) {
+			if (bo->pages[i] == NULL)
+				continue;
+			bo->pages[i]->flags &= ~PG_FICTITIOUS;
+			bo->pages[i]->oflags |= VPO_UNMANAGED;
+			vm_page_unwire_noq(bo->pages[i]);
+			vm_page_free(bo->pages[i]);
+		}
+		free(bo->pages, M_DEVBUF);
+	}
+	drm_gem_object_release(gem_obj);
+	free(bo, M_DEVBUF);
+}
+
+/* drm_driver.dumb_create */
+static int
+vmsvga_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
+    struct drm_mode_create_dumb *args)
+{
+	struct vmsvga_softc *sc = device_get_softc(ddev->dev);
+	struct vmsvga_gem_bo *bo;
+	struct pctrie_iter pages_iter;
+	vm_page_t m;
+	size_t i, size;
+	int tries, error;
+
+	args->pitch = args->width * (args->bpp / 8);
+	args->size  = (uint64_t)args->pitch * args->height;
+	size = round_page(args->size);
+	if (size == 0)
+		return (-EINVAL);
+
+	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
+	bo->size   = size;
+	bo->npages = atop(size);
+	bo->pages  = malloc(sizeof(vm_page_t) * bo->npages, M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+
+	tries = 0;
+retry_alloc:
+	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
+	    bo->npages, 0, ~0UL, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+	if (m == NULL) {
+		if (tries++ < 3) {
+			vm_page_reclaim_contig(0, bo->npages, 0, ~0UL,
+			    PAGE_SIZE, 0);
+			goto retry_alloc;
+		}
+		free(bo->pages, M_DEVBUF);
+		free(bo, M_DEVBUF);
+		return (-ENOMEM);
+	}
+	for (i = 0; i < bo->npages; i++, m++) {
+		m->valid = VM_PAGE_BITS_ALL;
+		bo->pages[i] = m;
+	}
+	bo->pbase = VM_PAGE_TO_PHYS(bo->pages[0]);
+
+	if (vmem_alloc(kernel_arena, size, M_WAITOK | M_BESTFIT,
+	    &bo->vbase) != 0) {
+		error = -ENOMEM;
+		goto err_pages;
+	}
+	pmap_qenter(bo->vbase, bo->pages, bo->npages);
+
+	bo->resource_id = atomic_fetchadd_32(&sc->next_resource_id, 1);
+
+	error = drm_gem_object_init(ddev, &bo->gem_obj, size);
+	if (error != 0)
+		goto err_vmap;
+	error = drm_gem_create_mmap_offset(&bo->gem_obj);
+	if (error != 0)
+		goto err_gem;
+
+	/*
+	 * Pre-allocate the cdev_pager keyed by gem_obj and insert all our
+	 * pages into it.  drm_gem_mmap_single() later calls
+	 * cdev_pager_allocate() with the same handle and gets THIS pager
+	 * back, so userland mmap shares the exact same vm_pages we hold
+	 * via bo->vbase.
+	 */
+	bo->cdev_pager = cdev_pager_allocate(&bo->gem_obj, OBJT_MGTDEVICE,
+	    &vmsvga_gem_pager_ops, size, 0, 0, NULL);
+	if (bo->cdev_pager == NULL) {
+		error = -ENOMEM;
+		goto err_gem;
+	}
+	vm_page_iter_init(&pages_iter, bo->cdev_pager);
+	VM_OBJECT_WLOCK(bo->cdev_pager);
+	for (i = 0; i < bo->npages; i++) {
+		bo->pages[i]->oflags &= ~VPO_UNMANAGED;
+		bo->pages[i]->flags  |= PG_FICTITIOUS;
+		if (vm_page_iter_insert(bo->pages[i], bo->cdev_pager,
+		    i, &pages_iter) != 0) {
+			VM_OBJECT_WUNLOCK(bo->cdev_pager);
+			error = -EINVAL;
+			goto err_pager;
+		}
+	}
+	VM_OBJECT_WUNLOCK(bo->cdev_pager);
+
+	error = drm_gem_handle_create(file_priv, &bo->gem_obj, &args->handle);
+	if (error != 0)
+		goto err_pager;
+
+	mtx_lock(&sc->bos_mtx);
+	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	mtx_unlock(&sc->bos_mtx);
+
+	drm_gem_object_unreference_unlocked(&bo->gem_obj);
+	return (0);
+
+err_pager:
+	vm_object_deallocate(bo->cdev_pager);
+	bo->cdev_pager = NULL;
+err_gem:
+	drm_gem_object_release(&bo->gem_obj);
+err_vmap:
+	pmap_qremove(bo->vbase, bo->npages);
+	vmem_free(kernel_arena, bo->vbase, bo->size);
+err_pages:
+	for (i = 0; i < bo->npages; i++) {
+		if (bo->pages[i] == NULL)
+			continue;
+		vm_page_unwire_noq(bo->pages[i]);
+		vm_page_free(bo->pages[i]);
+	}
+	free(bo->pages, M_DEVBUF);
+	free(bo, M_DEVBUF);
+	return (error);
+}
+
+static int
+vmsvga_dumb_map_offset(struct drm_file *file_priv, struct drm_device *ddev,
+    uint32_t handle, uint64_t *offset)
+{
+	struct drm_gem_object *gem_obj;
+	int error = 0;
+
+	DRM_LOCK(ddev);
+	gem_obj = drm_gem_object_lookup(ddev, file_priv, handle);
+	if (gem_obj == NULL) {
+		DRM_UNLOCK(ddev);
+		return (-EINVAL);
+	}
+	error = drm_gem_create_mmap_offset(gem_obj);
+	if (error == 0) {
+		*offset = DRM_GEM_MAPPING_OFF(gem_obj->map_list.key) |
+		    DRM_GEM_MAPPING_KEY;
+	}
+	drm_gem_object_unreference(gem_obj);
+	DRM_UNLOCK(ddev);
+	return (error);
+}
+
+static int
+vmsvga_dumb_destroy(struct drm_file *file_priv, struct drm_device *ddev,
+    uint32_t handle)
+{
+	return (drm_gem_handle_delete(file_priv, handle));
+}
+
+/* ---- framebuffer funcs (now wrap a GEM bo) ---- */
+
+static void
+vmsvga_drm_fb_destroy(struct drm_framebuffer *drm_fb)
+{
+	struct vmsvga_drm_framebuffer *fb =
+	    (struct vmsvga_drm_framebuffer *)drm_fb;
+
+	if (fb->bo != NULL)
+		drm_gem_object_unreference_unlocked(&fb->bo->gem_obj);
+	drm_framebuffer_cleanup(drm_fb);
 	free(fb, M_DEVBUF);
 }
 
 static int
-vmsvga_drm_fb_create_handle(struct drm_framebuffer *fb,
+vmsvga_drm_fb_create_handle(struct drm_framebuffer *drm_fb,
     struct drm_file *file_priv, unsigned int *handle)
 {
-	return (-ENODEV);	/* dumb_create handles GEM in Phase C.2 */
+	struct vmsvga_drm_framebuffer *fb =
+	    (struct vmsvga_drm_framebuffer *)drm_fb;
+
+	return (drm_gem_handle_create(file_priv, &fb->bo->gem_obj, handle));
 }
 
 static const struct drm_framebuffer_funcs vmsvga_drm_fb_funcs = {
@@ -393,22 +657,29 @@ static int
 vmsvga_drm_fb_create(struct drm_device *ddev, struct drm_file *file,
     struct drm_mode_fb_cmd2 *mode_cmd, struct drm_framebuffer **fb_out)
 {
-	struct drm_framebuffer *fb;
-	int ret;
+	struct drm_gem_object *gem_obj;
+	struct vmsvga_drm_framebuffer *fb;
+	int error;
+
+	gem_obj = drm_gem_object_lookup(ddev, file, mode_cmd->handles[0]);
+	if (gem_obj == NULL)
+		return (-ENOENT);
 
 	fb = malloc(sizeof(*fb), M_DEVBUF, M_WAITOK | M_ZERO);
-	ret = drm_framebuffer_init(ddev, fb, &vmsvga_drm_fb_funcs);
-	if (ret != 0) {
+	fb->bo = (struct vmsvga_gem_bo *)gem_obj;
+	fb->base.pitches[0] = mode_cmd->pitches[0];
+	fb->base.offsets[0] = mode_cmd->offsets[0];
+	fb->base.width  = mode_cmd->width;
+	fb->base.height = mode_cmd->height;
+	fb->base.depth         = 24;
+	fb->base.bits_per_pixel = 32;
+	error = drm_framebuffer_init(ddev, &fb->base, &vmsvga_drm_fb_funcs);
+	if (error != 0) {
+		drm_gem_object_unreference_unlocked(gem_obj);
 		free(fb, M_DEVBUF);
-		return (ret);
+		return (error);
 	}
-	fb->width  = mode_cmd->width;
-	fb->height = mode_cmd->height;
-	fb->pitches[0] = mode_cmd->pitches[0];
-	fb->offsets[0] = mode_cmd->offsets[0];
-	fb->depth      = 24;
-	fb->bits_per_pixel = 32;
-	*fb_out = fb;
+	*fb_out = &fb->base;
 	return (0);
 }
 
@@ -665,6 +936,11 @@ static struct drm_driver vmsvga_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME,
 	.load		 = vmsvga_drm_load,
 	.unload		 = vmsvga_drm_unload,
+	.gem_free_object = vmsvga_gem_free_object,
+	.gem_pager_ops	 = &vmsvga_gem_pager_ops,
+	.dumb_create	 = vmsvga_dumb_create,
+	.dumb_map_offset = vmsvga_dumb_map_offset,
+	.dumb_destroy	 = vmsvga_dumb_destroy,
 	.name		 = "vmsvga_drm",
 	.desc		 = VMSVGA_DRM_DRIVER_DESC,
 	.date		 = "20260527",
@@ -1022,6 +1298,10 @@ vmsvga_attach(device_t dev)
 
 	vmsvga_read_hw_info(sc);
 
+	TAILQ_INIT(&sc->bos);
+	mtx_init(&sc->bos_mtx, "vmsvga_bos", NULL, MTX_DEF);
+	sc->next_resource_id = 1;
+
 	sc->want_width  = 1024;
 	sc->want_height = 768;
 	sc->want_bpp    = 32;
@@ -1085,6 +1365,7 @@ vmsvga_detach(device_t dev)
 		drm_put_dev(sc->drm_dev);
 		sc->drm_dev = NULL;
 	}
+	mtx_destroy(&sc->bos_mtx);
 	vmsvga_free_resources(sc);
 	return (0);
 }
