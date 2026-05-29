@@ -60,8 +60,8 @@
  *   - X.org with the modesetting driver therefore produces a
  *     dark screen on VBox arm64; use scfb instead.
  *
- * Expected to work on other hosts (not yet tested by author)
- * ----------------------------------------------------------
+ * Expected to work on other hosts (not yet tested)
+ * -------------------------------------------------
  *   - VMware Fusion / Workstation / ESXi: classic SVGA-II
  *     implementation; FB BAR + FIFO both work per protocol.
  *     Should yield visible pixels with no driver changes.
@@ -87,8 +87,7 @@
  *   - Linux vmwgfx (svga_reg.h, vmwgfx_drv.c): 2D subset only
  *   - Legacy xorg-server vmware-svga driver
  *   - FreeBSD-arm64 in-base drm2 source (sys/dev/drm2/)
- *   - virtio_drm.c by the same author -- same KMS / GEM shape,
- *     different transport.
+ *   - virtio_drm.c -- same KMS / GEM shape, different transport.
  */
 
 #include <sys/param.h>

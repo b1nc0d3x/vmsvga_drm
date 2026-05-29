@@ -39,7 +39,7 @@ its functional ceiling on this host — `/dev/dri/card0` works, dumb
 buffers work — but DRM-driven scanout is impossible until Oracle ships
 a working SVGA-II implementation. On VMware Fusion / Workstation / ESXi
 the same driver should produce visible pixels with no code changes;
-not yet tested by the author.
+not yet tested.
 
 ## Build
 
@@ -174,7 +174,7 @@ Detailed write-ups for every phase are in the commit messages.
 BSD-2-Clause throughout. SPDX-License-Identifier headers present on
 every source file.
 
-## Related work by the same author
+## Related repos
 
 - [`virtio_drm`](https://github.com/b1nc0d3x/virtio_drm) — sibling
   driver for VirtIO GPU; same KMS / GEM scaffold, different transport.
