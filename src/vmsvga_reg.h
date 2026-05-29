@@ -1,6 +1,8 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
+ * Copyright (c) 2026, Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
  * VMware SVGA-II hardware register and FIFO command definitions.
  *
  * Derived from VMware's public SVGA device interface specification

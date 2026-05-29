@@ -1,4 +1,8 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026, Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
  * Minimal Phase C.2 verifier: open /dev/dri/card0, create a
  * dumb buffer via DRM_IOCTL_MODE_CREATE_DUMB, map it, write
  * a pattern, dump-destroy it.  No display work -- just proves
