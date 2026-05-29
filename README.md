@@ -53,10 +53,25 @@ env MACHINE=arm64 MACHINE_ARCH=aarch64 \
 
 Produces `src/vmsvga_drm.ko` (~36 KB).
 
-Requires the running kernel to have `device drm2` statically linked.
-Loading `drm2` itself as a module is not supported by the in-tree
-infrastructure; use a custom `KERNCONF` (e.g. `GENERIC` + `device
-drm2 + device fbd`).
+### Prerequisite: a kernel with `device drm2` on aarch64
+
+`drm2` on aarch64 is **not officially supported in upstream FreeBSD**
+(canonical drm2 has historically been x86-only). The running kernel
+must therefore be a custom build of `GENERIC` + `device drm2` +
+`device fbd` — stock FreeBSD-arm64 `GENERIC` will not work, and
+`drm2.ko` is not packaged as a loadable module in the in-tree
+infrastructure.
+
+In practice this means cross-building a custom `KERNCONF` (a one-line
+include + two `device` adds is enough), installing the resulting
+kernel beside `/boot/kernel/`, and pointing `loader.conf` at it via
+`kernel="kernel.your_name"`. The driver itself doesn't care which
+host you're on — what it needs is a kernel that has drm2 baked in.
+
+This is a real friction point and one of the motivating reasons for
+the ongoing FreeBSD upstream work on drm2 (e.g. PR #2220 for
+PRIME/DRI3, PR #2228 for the kmod ldscript fix that lets DRM kmods
+loader-preload on arm64).
 
 ## Load
 
