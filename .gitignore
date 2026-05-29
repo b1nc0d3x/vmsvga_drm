@@ -1,0 +1,20 @@
+# Build artifacts
+src/*.o
+src/*.ko
+src/*.kld
+src/.depend.*
+src/export_syms
+src/machine
+src/x86
+src/i386
+src/bus_if.h
+src/device_if.h
+src/fb_if.h
+src/pci_if.h
+src/opt_*.h
+
+# Keep the project's own header
+!src/vmsvga_reg.h
+
+# Reference stamp (large, not part of the actual driver)
+src/*.stamp

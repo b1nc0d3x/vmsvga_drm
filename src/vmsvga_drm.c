@@ -3,28 +3,92 @@
  *
  * Copyright (c) 2026, Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * vmsvga_drm: FreeBSD drm2 driver for VMware SVGA-II graphics
- * adapters (PCI vendor 0x15ad device 0x0405 / 0x0406), the only
- * GPU exposed to VirtualBox arm64 guests and the legacy 2D path
- * used by VMware Fusion / Workstation / ESXi.
+ * vmsvga_drm -- FreeBSD/aarch64 drm2 driver for VMware SVGA-II
+ * graphics adapters (PCI 0x15ad:0x0405 and 0x0406).
  *
- * Bring-up plan, in order:
+ * Why this driver exists
+ * ----------------------
+ * On FreeBSD/aarch64 there is no working DRM-KMS driver for any
+ * GPU that VirtualBox arm64 actually exposes to the guest.  VBox
+ * arm64's only emulated display is VMware SVGA-II; vmwgfx in
+ * drm-kmod cannot run on aarch64 because drm-kmod is built on
+ * LinuxKPI, which is x86-only.  Without a native driver every
+ * FreeBSD-arm64 VBox guest is stuck on the EFI loader's static
+ * framebuffer (efifb) with no /dev/dri/card0 -- no DRI3, no
+ * dumb buffers, no path for an X11 modesetting driver, no path
+ * for any Mesa client.
  *
- *   Phase A (this file): newbus probe + attach, BAR mapping,
- *                        SVGA_REG_ID handshake, capabilities &
- *                        VRAM/FIFO sizing, sysctls.  Loads cleanly
- *                        but exposes no DRM device yet.
- *   Phase B:             FIFO init + SVGA_CMD_UPDATE emit; first
- *                        "tell the host we changed pixel X" works.
- *   Phase C:             drm_device registration + dumb-buffer +
- *                        single CRTC/encoder/virtual-connector.
- *                        /dev/dri/card0 appears.
- *   Phase D:             fbd glue + vt(4) console handover so the
- *                        boot console moves onto the SVGA scanout.
+ * vmsvga_drm closes the gap by binding to the SVGA-II device
+ * directly via the in-base drm2 stack (no LinuxKPI), exposing a
+ * working /dev/dri/card0 with dumb-buffer ioctls.  Userland
+ * clients can allocate, map, write, and free DRM buffers exactly
+ * as they would on any other DRM device.
  *
- * Reference: linux/drivers/gpu/drm/vmwgfx (2D subset only),
- * the legacy xorg vmware-svga driver, and our own virtio_drm.c
- * (same shape, different transport).
+ * Phase status (mapped on VBox arm64; commit history has details)
+ * ---------------------------------------------------------------
+ *   A. PCI bind + SVGA_REG_ID handshake + capability decode  DONE
+ *   B. Mode set via SVGA registers                            DONE
+ *      FB BAR write panics VBox arm64 host emulation         BLOCKED
+ *      FIFO discovery (SVGA_REG_MEM_START)                    BLOCKED
+ *      (Host reports MEM_START=0; refuses guest writes too.)
+ *   C.1 drm_device registration + KMS scaffold                DONE
+ *       /dev/dri/card0 + controlD64 appear.
+ *   C.2 dumb_create / map / mmap / destroy in guest RAM       DONE
+ *       Backing pages via vm_page_alloc_noobj_contig + cdev_pager
+ *       so userspace mmap shares pages with the kernel vbase.
+ *   D.  Guest-allocated FIFO probe                            DEAD-END
+ *       Verified that VBox arm64 ignores guest writes to
+ *       SVGA_REG_MEM_START; there is no path from guest pages
+ *       to host scanout on this host.  Behind a sysctl gate.
+ *
+ * What works in practice on VBox arm64
+ * ------------------------------------
+ *   - /dev/dri/card0 + dumb buffers, validated end-to-end via
+ *     tools/dumb_test.c (CREATE / MAP / mmap / write / readback /
+ *     DESTROY across a 3 MB buffer).
+ *   - Mode-set registers programmable, readback matches.
+ *   - Coexists with X.org using the scfb driver -- scfb paints
+ *     efifb directly, vmsvga_drm sits idle on /dev/dri/card0,
+ *     no driver fight.
+ *
+ * What does NOT work on VBox arm64 (and won't, until Oracle
+ * ships a working SVGA-II)
+ * ---------------------------------
+ *   - Visible pixels delivered via DRM.  There is no working
+ *     guest -> host pixel path: FB BAR writes panic, FIFO is
+ *     unreachable in both host- and guest-allocated forms.
+ *   - X.org with the modesetting driver therefore produces a
+ *     dark screen on VBox arm64; use scfb instead.
+ *
+ * Expected to work on other hosts (not yet tested by author)
+ * ----------------------------------------------------------
+ *   - VMware Fusion / Workstation / ESXi: classic SVGA-II
+ *     implementation; FB BAR + FIFO both work per protocol.
+ *     Should yield visible pixels with no driver changes.
+ *
+ * Hard-won implementation notes
+ * -----------------------------
+ *   - Use drm_get_platform_dev, NOT drm_get_pci_dev, even though
+ *     we attach under vgapci.  The PCI variant calls
+ *     pci_get_domain/bus/slot/func on dev->dev and panics for
+ *     vgapci children; the platform variant just trusts dev->dev.
+ *   - On aarch64 SVGA registers are MMIO-mapped flat (each reg at
+ *     reg * 4); only x86 uses the INDEX/VALUE port pair.  Detect
+ *     via SYS_RES type on BAR0.
+ *   - VBox arm64 leaves BAR1 unpopulated and puts the framebuffer
+ *     at BAR2.  Walk BARs 1..5 to find the largest memory BAR
+ *     rather than hard-coding slot 1.
+ *   - Never write the FB BAR with bus_space_* on VBox arm64 even
+ *     if it appears KVA-mapped (rman_get_virtual returns sane).
+ *     The host emulation crashes the guest on the first write.
+ *
+ * References
+ * ----------
+ *   - Linux vmwgfx (svga_reg.h, vmwgfx_drv.c): 2D subset only
+ *   - Legacy xorg-server vmware-svga driver
+ *   - FreeBSD-arm64 in-base drm2 source (sys/dev/drm2/)
+ *   - virtio_drm.c by the same author -- same KMS / GEM shape,
+ *     different transport.
  */
 
 #include <sys/param.h>
