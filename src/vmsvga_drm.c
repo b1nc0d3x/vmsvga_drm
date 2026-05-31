@@ -60,11 +60,20 @@
  *   - X.org with the modesetting driver therefore produces a
  *     dark screen on VBox arm64; use scfb instead.
  *
- * Expected to work on other hosts (not yet tested)
- * -------------------------------------------------
- *   - VMware Fusion / Workstation / ESXi: classic SVGA-II
- *     implementation; FB BAR + FIFO both work per protocol.
- *     Should yield visible pixels with no driver changes.
+ * Host coverage status
+ * --------------------
+ *   - VBox arm64 (Apple Silicon host): DEAD-END.  /dev/dri/card0
+ *     usable, dumb buffers + mmap work, but no guest -> host
+ *     pixel path (see Phase D notes above).
+ *   - VMware Fusion arm64 (Apple Silicon host): DEAD-END.  BAR0
+ *     reads back 0xffffffff despite PCI cmd=0x0007 and successful
+ *     probe; cause unresolved.  Linux-guest baseline test on the
+ *     same VM is the next diagnostic step.
+ *   - VMware Fusion (Intel host) / Workstation / ESXi:
+ *     UNVALIDATED.  Classic SVGA-II implementation per spec;
+ *     expected to yield visible pixels via the existing code
+ *     path (no driver changes anticipated).  Requires an Intel
+ *     host -- not available to the author yet.
  *
  * Hard-won implementation notes
  * -----------------------------
