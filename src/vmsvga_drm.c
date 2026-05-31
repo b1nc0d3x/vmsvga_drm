@@ -1179,19 +1179,52 @@ static int
 vmsvga_negotiate_id(struct vmsvga_softc *sc)
 {
 	uint32_t id;
+	int i;
+
+	/* Bring-up diagnostic: dump first 32 dwords of BAR0 as-is. */
+	device_printf(sc->dev,
+	    "BAR0 type=%s size=%lu raw dump:\n",
+	    sc->reg_type == SYS_RES_IOPORT ? "IOPORT" : "MEMORY",
+	    (unsigned long)rman_get_size(sc->reg_res));
+	for (i = 0; i < 32; i += 4) {
+		device_printf(sc->dev,
+		    "  bar0[%02x..%02x] = %08x %08x %08x %08x\n",
+		    i * 4, (i + 4) * 4 - 1,
+		    bus_space_read_4(sc->reg_bst, sc->reg_bsh, (i + 0) * 4),
+		    bus_space_read_4(sc->reg_bst, sc->reg_bsh, (i + 1) * 4),
+		    bus_space_read_4(sc->reg_bst, sc->reg_bsh, (i + 2) * 4),
+		    bus_space_read_4(sc->reg_bst, sc->reg_bsh, (i + 3) * 4));
+	}
+	/*
+	 * Try INDEX/VALUE indirection even on MEMORY BAR0 -- some
+	 * VMware hosts present the legacy IO-port-style register
+	 * window via MMIO instead of a flat register array.
+	 * INDEX_PORT is dword 0 (offset 0), VALUE_PORT is dword 1
+	 * (offset 4) in the classic SVGA-II layout.
+	 */
+	bus_space_write_4(sc->reg_bst, sc->reg_bsh, 0, SVGA_REG_ID);
+	id = bus_space_read_4(sc->reg_bst, sc->reg_bsh, 4);
+	device_printf(sc->dev,
+	    "INDEX/VALUE probe at offset 0/4: id = 0x%08x\n", id);
 
 	/*
 	 * Write the highest version we want, read back the highest
-	 * the host supports.  Convention: write SVGA_ID_2, accept
-	 * whatever comes back as long as it's >= SVGA_ID_0.
+	 * the host supports.  VMware Fusion (Apple Silicon) exposes
+	 * SVGA_ID_3; legacy hosts cap at SVGA_ID_2.  Walk down until
+	 * the host accepts.
 	 */
-	vmsvga_write_reg(sc, SVGA_REG_ID, SVGA_ID_2);
+	vmsvga_write_reg(sc, SVGA_REG_ID, SVGA_ID_3);
 	id = vmsvga_read_reg(sc, SVGA_REG_ID);
-	if (id != SVGA_ID_2) {
+	if (id != SVGA_ID_3) {
+		vmsvga_write_reg(sc, SVGA_REG_ID, SVGA_ID_2);
+		id = vmsvga_read_reg(sc, SVGA_REG_ID);
+	}
+	if (id != SVGA_ID_3 && id != SVGA_ID_2) {
 		vmsvga_write_reg(sc, SVGA_REG_ID, SVGA_ID_1);
 		id = vmsvga_read_reg(sc, SVGA_REG_ID);
 	}
-	if (id != SVGA_ID_2 && id != SVGA_ID_1 && id != SVGA_ID_0) {
+	if (id != SVGA_ID_3 && id != SVGA_ID_2 &&
+	    id != SVGA_ID_1 && id != SVGA_ID_0) {
 		device_printf(sc->dev,
 		    "SVGA ID handshake failed (got 0x%08x)\n", id);
 		return (ENXIO);

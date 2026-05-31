@@ -35,6 +35,7 @@
 #define	SVGA_ID_0		SVGA_MAKE_ID(0)
 #define	SVGA_ID_1		SVGA_MAKE_ID(1)
 #define	SVGA_ID_2		SVGA_MAKE_ID(2)
+#define	SVGA_ID_3		SVGA_MAKE_ID(3)
 #define	SVGA_ID_INVALID		0xffffffff
 
 /*
