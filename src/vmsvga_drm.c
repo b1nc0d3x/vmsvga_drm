@@ -201,14 +201,6 @@ struct vmsvga_softc {
 	TAILQ_HEAD(, vmsvga_gem_bo) bos;
 	struct mtx		 bos_mtx;
 	uint32_t		 next_resource_id;
-
-	/* Phase D: guest-allocated FIFO probe. */
-	vm_offset_t		 gfifo_vbase;
-	vm_paddr_t		 gfifo_pbase;
-	vm_page_t	       *gfifo_pages;
-	size_t			 gfifo_npages;
-	size_t			 gfifo_size;
-	bool			 gfifo_ready;
 };
 
 /* GEM bo backing one dumb buffer.  All memory is in guest RAM --
@@ -414,31 +406,6 @@ vmsvga_fifo_push(struct vmsvga_softc *sc, uint32_t dword)
 	if (next == max)
 		next = min;
 	vmsvga_fifo_write(sc, SVGA_FIFO_NEXT_CMD, next);
-}
-
-static int
-vmsvga_fifo_emit_update(struct vmsvga_softc *sc,
-    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
-{
-	int err;
-
-	if (!sc->fifo_ready)
-		return (ENXIO);
-	err = vmsvga_fifo_reserve(sc, 5 * 4);
-	if (err != 0) {
-		device_printf(sc->dev,
-		    "FIFO reserve timeout\n");
-		return (err);
-	}
-	vmsvga_fifo_push(sc, SVGA_CMD_UPDATE);
-	vmsvga_fifo_push(sc, x);
-	vmsvga_fifo_push(sc, y);
-	vmsvga_fifo_push(sc, w);
-	vmsvga_fifo_push(sc, h);
-	/* Kick. */
-	vmsvga_write_reg(sc, SVGA_REG_SYNC, 1);
-	(void)vmsvga_read_reg(sc, SVGA_REG_BUSY);
-	return (0);
 }
 
 /* ---------- mode set ---------- */
@@ -1333,136 +1300,60 @@ vmsvga_sysctl_test_pattern(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * Phase D probe: try to negotiate a guest-allocated FIFO with the
- * host.  Classic SVGA-II expects host-provided FIFO base via
- * SVGA_REG_MEM_START -- but VBox arm64 reports MEM_START=0 even
- * though MEM_SIZE is non-zero (2 MB).  Hypothesis: the host wants
- * the guest to provide its own FIFO ring in guest RAM, in which
- * case writing a guest physaddr to MEM_START should stick.
- *
- * Sequence:
- *   1. allocate `size` bytes of physically contiguous wired pages
- *   2. write gfifo_pbase to SVGA_REG_MEM_START
- *   3. write size            to SVGA_REG_MEM_SIZE
- *   4. read SVGA_REG_MEM_START -- if it equals what we wrote, the
- *      host accepted our base
- *   5. init the FIFO header at the start of the buffer
- *   6. write SVGA_REG_CONFIG_DONE = 1
- *   7. emit SVGA_CMD_UPDATE for the full framebuffer + SYNC
- *
- * Done as a sysctl to isolate any guest-panic risk from kldload.
+ * Phase D animation probe: cycle the entire framebuffer through
+ * eight solid colours, one frame per ~100 ms tick.  Value written is
+ * the frame count.  Proves no per-frame host sync is required --
+ * BAR2 writes are picked up by the next scanout refresh.
  */
 static int
-vmsvga_sysctl_fifo_probe(SYSCTL_HANDLER_ARGS)
+vmsvga_sysctl_animate(SYSCTL_HANDLER_ARGS)
 {
+	static const uint32_t colors[8] = {
+		0x00ff0000u, 0x00ff8000u, 0x00ffff00u, 0x0000ff00u,
+		0x0000ffffu, 0x000000ffu, 0x008000ffu, 0x00ff00ffu,
+	};
 	struct vmsvga_softc *sc = arg1;
-	int val = 0, err, tries;
-	size_t size, i;
-	vm_page_t m;
-	uint32_t header[SVGA_FIFO_NUM_REGS], readback;
+	bus_space_tag_t bst;
+	bus_space_handle_t bsh;
+	uint32_t w, h, stride, x, y, c;
+	int frames = 0, err, frame;
 
-	err = sysctl_handle_int(oidp, &val, 0, req);
+	err = sysctl_handle_int(oidp, &frames, 0, req);
 	if (err != 0 || req->newptr == NULL)
 		return (err);
-	if (val != 1)
+	if (frames <= 0 || frames > 1000)
 		return (EINVAL);
-	if (sc->gfifo_ready) {
-		device_printf(sc->dev, "fifo_probe: already initialised\n");
-		return (EBUSY);
-	}
+	if (sc->fb_res == NULL)
+		return (ENXIO);
 
-	size = 256 * 1024;	/* small ring; keep blast radius bounded */
-	sc->gfifo_npages = atop(size);
-	sc->gfifo_pages  = malloc(sizeof(vm_page_t) * sc->gfifo_npages,
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	err = vmsvga_set_mode(sc, sc->want_width, sc->want_height, 32);
+	if (err != 0)
+		return (err);
 
-	tries = 0;
-retry_alloc:
-	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
-	    sc->gfifo_npages, 0, ~0UL, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
-	if (m == NULL) {
-		if (tries++ < 3) {
-			vm_page_reclaim_contig(0, sc->gfifo_npages, 0, ~0UL,
-			    PAGE_SIZE, 0);
-			goto retry_alloc;
+	w = sc->cur_width;
+	h = sc->cur_height;
+	stride = sc->cur_bytes_per_line;
+	if (w == 0 || h == 0 || stride < w * 4)
+		return (EIO);
+	if ((bus_size_t)stride * h > sc->fb_size)
+		return (E2BIG);
+
+	bst = rman_get_bustag(sc->fb_res);
+	bsh = rman_get_bushandle(sc->fb_res);
+
+	device_printf(sc->dev,
+	    "animate: %d frames at %ux%u@32bpp\n", frames, w, h);
+	for (frame = 0; frame < frames; frame++) {
+		c = colors[frame & 7];
+		for (y = 0; y < h; y++) {
+			for (x = 0; x < w; x++) {
+				bus_space_write_4(bst, bsh,
+				    (bus_size_t)y * stride + x * 4, c);
+			}
 		}
-		free(sc->gfifo_pages, M_DEVBUF);
-		sc->gfifo_pages = NULL;
-		return (ENOMEM);
+		pause("vmsvga_anim", hz / 10);
 	}
-	for (i = 0; i < sc->gfifo_npages; i++, m++) {
-		m->valid = VM_PAGE_BITS_ALL;
-		sc->gfifo_pages[i] = m;
-	}
-	sc->gfifo_pbase = VM_PAGE_TO_PHYS(sc->gfifo_pages[0]);
-	sc->gfifo_size  = size;
-
-	if (vmem_alloc(kernel_arena, size, M_WAITOK | M_BESTFIT,
-	    &sc->gfifo_vbase) != 0) {
-		device_printf(sc->dev, "fifo_probe: vmem_alloc failed\n");
-		for (i = 0; i < sc->gfifo_npages; i++) {
-			vm_page_unwire_noq(sc->gfifo_pages[i]);
-			vm_page_free(sc->gfifo_pages[i]);
-		}
-		free(sc->gfifo_pages, M_DEVBUF);
-		sc->gfifo_pages = NULL;
-		return (ENOMEM);
-	}
-	pmap_qenter(sc->gfifo_vbase, sc->gfifo_pages, sc->gfifo_npages);
-	bzero((void *)sc->gfifo_vbase, size);
-
-	device_printf(sc->dev,
-	    "fifo_probe: allocated %zu bytes guest RAM at pa=0x%jx va=0x%jx\n",
-	    size, (uintmax_t)sc->gfifo_pbase, (uintmax_t)sc->gfifo_vbase);
-
-	/* Tell the host where our FIFO lives. */
-	device_printf(sc->dev,
-	    "fifo_probe: writing MEM_START + MEM_SIZE\n");
-	vmsvga_write_reg(sc, SVGA_REG_MEM_START, (uint32_t)sc->gfifo_pbase);
-	vmsvga_write_reg(sc, SVGA_REG_MEM_SIZE,  (uint32_t)size);
-	readback = vmsvga_read_reg(sc, SVGA_REG_MEM_START);
-	device_printf(sc->dev,
-	    "fifo_probe: MEM_START readback = 0x%08x (wrote 0x%08x)\n",
-	    readback, (uint32_t)sc->gfifo_pbase);
-	if (readback != (uint32_t)sc->gfifo_pbase) {
-		device_printf(sc->dev,
-		    "fifo_probe: host rejected guest-allocated FIFO\n");
-		return (ENOTSUP);
-	}
-
-	/* Initialise the FIFO header in our own buffer. */
-	header[SVGA_FIFO_MIN]      = SVGA_FIFO_NUM_REGS * 4;
-	header[SVGA_FIFO_MAX]      = size;
-	header[SVGA_FIFO_NEXT_CMD] = SVGA_FIFO_NUM_REGS * 4;
-	header[SVGA_FIFO_STOP]     = SVGA_FIFO_NUM_REGS * 4;
-	memcpy((void *)sc->gfifo_vbase, header, sizeof(header));
-
-	vmsvga_write_reg(sc, SVGA_REG_CONFIG_DONE, 1);
-	sc->gfifo_ready = true;
-
-	/*
-	 * Emit a single SVGA_CMD_UPDATE for the entire current scanout
-	 * directly into the guest FIFO buffer.  Bump NEXT_CMD by 5
-	 * dwords, write SYNC, read BUSY -- if the host actually
-	 * consumes this and runs the command, the FIFO works.
-	 */
-	{
-		uint32_t *ring = (uint32_t *)sc->gfifo_vbase;
-		uint32_t next  = SVGA_FIFO_NUM_REGS;
-		ring[next + 0] = SVGA_CMD_UPDATE;
-		ring[next + 1] = 0;
-		ring[next + 2] = 0;
-		ring[next + 3] = sc->cur_width  ? sc->cur_width  : 1;
-		ring[next + 4] = sc->cur_height ? sc->cur_height : 1;
-		ring[SVGA_FIFO_NEXT_CMD] = (next + 5) * 4;
-		vmsvga_write_reg(sc, SVGA_REG_SYNC, 1);
-		(void)vmsvga_read_reg(sc, SVGA_REG_BUSY);
-	}
-
-	device_printf(sc->dev,
-	    "fifo_probe: ACCEPTED.  FIFO header in guest RAM, "
-	    "CONFIG_DONE=1, one UPDATE emitted (%ux%u)\n",
-	    sc->cur_width, sc->cur_height);
+	device_printf(sc->dev, "animate: done\n");
 	return (0);
 }
 
@@ -1596,18 +1487,16 @@ vmsvga_sysctl_setup(struct vmsvga_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    vmsvga_sysctl_diag, "I",
 	    "Write 1 to dump BAR mappings + live SVGA reg state");
-	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "fifo_probe",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    vmsvga_sysctl_fifo_probe, "I",
-	    "Phase D probe: allocate guest RAM, write physaddr to "
-	    "SVGA_REG_MEM_START, init FIFO header, set CONFIG_DONE=1, "
-	    "emit one SVGA_CMD_UPDATE.  Gated -- panic risk if host "
-	    "rejects guest-allocated FIFO.");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "test_pattern",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    vmsvga_sysctl_test_pattern, "I",
 	    "Modeset to want_*x32bpp and paint a four-quadrant colour "
 	    "pattern into the VRAM BAR.  First-pixels probe.");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "animate",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    vmsvga_sysctl_animate, "I",
+	    "Cycle the framebuffer through 8 solid colours; "
+	    "value = frame count.  Blocks for ~100 ms per frame.");
 }
 
 static int
