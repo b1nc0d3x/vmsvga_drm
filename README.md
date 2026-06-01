@@ -22,24 +22,56 @@ free DRM buffers exactly as they would on any other DRM device.
 
 ## Status matrix
 
-|                                   | VBox arm64       | VMware Fusion arm64 |
-|-----------------------------------|------------------|---------------------|
-| PCI bind                          | ✓                | expected ✓ (untested) |
-| SVGA register handshake (`ID_2`)  | ✓                | expected ✓          |
-| Mode set                          | ✓ readback OK    | expected ✓          |
-| `/dev/dri/card0` + KMS scaffold   | ✓                | expected ✓          |
-| Dumb buffer create / mmap / write | ✓ end-to-end     | expected ✓          |
-| Visible pixels via DRM            | ✗ — host bug     | expected ✓          |
+|                                       | VBox arm64       | VMware Fusion arm64       |
+|---------------------------------------|------------------|---------------------------|
+| PCI bind                              | ✓                | ✓                         |
+| SVGA register handshake               | ✓ (`ID_2`)       | ✓ (`ID_3`)                |
+| Mode set                              | ✓ readback OK    | ✓ readback OK             |
+| `/dev/dri/card0` + KMS scaffold       | ✓                | ✓                         |
+| Dumb buffer create / mmap / write     | ✓ end-to-end     | ✓ end-to-end              |
+| Visible pixels via VRAM BAR scanout   | ✗ — host bug     | ✓ — first pixels 2026-05-31 |
+| DRM-driven scanout (KMS modeset)      | ✗ — host bug     | partial (sysctl-driven; KMS wiring TODO) |
 
-VBox arm64 cannot accept pixels from the guest at all on its SVGA-II
-emulation: writes to the FB BAR panic the host, and both host-allocated
-and guest-allocated FIFO paths are blocked (host reports
-`SVGA_REG_MEM_START=0` and ignores guest writes). vmsvga_drm runs to
-its functional ceiling on this host — `/dev/dri/card0` works, dumb
-buffers work — but DRM-driven scanout is impossible until Oracle ships
-a working SVGA-II implementation. On VMware Fusion / Workstation / ESXi
-the same driver should produce visible pixels with no code changes;
-not yet tested.
+Fusion arm64 reaches **first pixels** via the legacy SVGA-II
+linear-framebuffer path: mode-set via `SVGA_REG_{ENABLE, WIDTH,
+HEIGHT, BITS_PER_PIXEL}`, then write pixels straight into the VRAM
+BAR. Caps mask `0xfd260260` does **not** advertise `SCREEN_OBJECT_2`
+or `DISPLAY_TOPOLOGY` — the legacy linear-FB path is the correct
+first step on this host. FIFO is `mem_start=0` (unavailable) and is
+not needed.
+
+VBox arm64 still cannot accept pixels from the guest on its SVGA-II
+emulation: writes to the FB BAR panic the host, and both
+host-allocated and guest-allocated FIFO paths are blocked (host
+reports `SVGA_REG_MEM_START=0` and ignores guest writes). vmsvga_drm
+runs to its functional ceiling on this host — `/dev/dri/card0` works,
+dumb buffers work — but DRM-driven scanout is impossible until Oracle
+ships a working SVGA-II implementation.
+
+VMware Workstation / ESXi / Fusion on Intel are expected to mirror
+the Fusion arm64 path; not yet tested.
+
+### Fusion arm64: required `.vmx` settings
+
+Fusion generates per-VM ACPI tables based on the VM configuration.
+Two `.vmx` keys gate whether the SVGA-II adapter ends up at a routed
+BAR address:
+
+```
+monitor.phys_bits_used = "36"      # 32 caps phys addressing at 4 GB
+memsize                = "6144"    # 2048 doesn't produce a high MMIO window
+```
+
+With `monitor.phys_bits_used = "32"` Fusion emits an SSDT whose
+high-memory descriptor has `M64S = 0` (zero-length window). UEFI is
+then forced to park BAR0 in the low PCI window at `0x3d000000`,
+which on Fusion arm64 is **not routed to the SVGA device** — reads
+return `0xffffffff` and no register access works. Bumping
+`phys_bits_used` to `36` (64 GB addressing) and `memsize` to at least
+`4096` makes Fusion emit a real high-memory window, and UEFI places
+BAR0 inside it (`0xfff800000` in practice).
+
+The VM must be powered off to edit `.vmx`.
 
 ## Build
 
@@ -100,7 +132,8 @@ dmesg | grep vmsvga_drm
 # 2. Device + sysctls
 ls /dev/dri
 sysctl dev.vmsvga_drm.0 | head
-# expect: card0 + controlD64; svga_id=0x90000002, caps, max, vram
+# expect: card0 + controlD64; svga_id 0x90000002 (legacy) or
+# 0x90000003 (Fusion arm64); caps, max_width / max_height, vram_size
 
 # 3. End-to-end ioctl through the driver
 cc -I/usr/local/include -o /usr/local/bin/dumb_test tools/dumb_test.c
@@ -115,6 +148,35 @@ dumb_test
 
 If all three pass the driver is fully functional at every layer it
 can be on the host.
+
+### Fusion arm64: first-pixels probe
+
+On Fusion arm64 there is a sysctl-driven probe that exercises the
+full mode-set → VRAM-BAR scanout path without needing X or a Mesa
+client:
+
+```sh
+# Pick a resolution within max_width × max_height
+sudo sysctl dev.vmsvga_drm.0.want_width=1920
+sudo sysctl dev.vmsvga_drm.0.want_height=1080
+
+# Paint a four-quadrant colour pattern straight into the VRAM BAR
+sudo sysctl dev.vmsvga_drm.0.test_pattern=1
+# expect:
+#   red    | green
+#   ---------------
+#   blue   | white
+
+# Cycle the framebuffer through eight solid colours (~100 ms per frame)
+sudo sysctl dev.vmsvga_drm.0.animate=80
+```
+
+These are diagnostic / smoke-test sysctls — not the eventual scanout
+path. The next milestone is wiring `vmsvga_set_mode` into the DRM
+atomic mode-set helper so userland `drmModeSetCrtc` ioctls drive the
+chip, and adding a dumb-buffer → VRAM-BAR blit (or a direct
+`SVGA_REG_FB_*` pointer override) so X / Wayland clients display
+through `/dev/dri/card0`.
 
 ## Coexistence with X.org on VBox arm64
 
@@ -144,7 +206,10 @@ efi_max_resolution="1920x1080"
 | B     | ce96904 | Mode set; FIFO discovery; documented FB BAR panic        |
 | C.1   | 5f057c5 | `drm_device` registration + KMS scaffold + `/dev/dri/card0` |
 | C.2   | a7952d1 | Dumb buffers in guest RAM via `cdev_pager` mmap          |
-| D     | 456b13b | Guest-allocated FIFO probe; documented dead-end          |
+| D pr. | 456b13b | Guest-allocated FIFO probe; documented dead-end on VBox  |
+| ID3   | 95edcea | Accept `SVGA_ID_3` (Fusion arm64) in negotiate           |
+| D px. | b106036 | First pixels on Fusion arm64 via VRAM-BAR linear scanout |
+| trim  | 8cf703f | Drop unreachable guest-FIFO probe and `gfifo_*` state    |
 
 Detailed write-ups for every phase are in the commit messages.
 
@@ -168,6 +233,19 @@ Detailed write-ups for every phase are in the commit messages.
   `PG_FICTITIOUS` set so the on-demand fault path never runs.
   Without this, `cdev_pager_allocate` creates a fresh empty pager
   per `mmap` and userspace writes never reach the kernel's mapping.
+- On Fusion arm64 the SVGA caps mask (`0xfd260260`) does **not**
+  advertise `SCREEN_OBJECT_2` or `DISPLAY_TOPOLOGY`. Don't chase
+  those paths — the host honours the legacy SVGA-II linear-FB
+  protocol instead: mode-set via `SVGA_REG_{ENABLE, WIDTH, HEIGHT,
+  BITS_PER_PIXEL}`, then write pixels straight into the VRAM BAR at
+  `y * SVGA_REG_BYTES_PER_LINE + x * 4`. No `SVGA_CMD_UPDATE`, no
+  FIFO sync — the host re-scans the BAR every refresh.
+- The Fusion arm64 BAR-routing problem turned out to be a per-VM
+  `.vmx` configuration issue, not a FreeBSD bug. See the
+  ["Required `.vmx` settings"](#fusion-arm64-required-vmx-settings)
+  section above. Linux on a different VM does not hit it because the
+  Ubuntu guest profile in Fusion defaults `monitor.phys_bits_used`
+  to `36`.
 
 ## License
 
