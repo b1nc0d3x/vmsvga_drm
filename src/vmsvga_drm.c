@@ -1259,6 +1259,80 @@ vmsvga_sysctl_apply_mode(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Phase D first-pixels probe: drive the host scanout directly via the
+ * legacy SVGA-II VRAM BAR.  On Fusion arm64 BAR2 is the linear
+ * framebuffer (fb_pa=0xff0000000, fb_size=128 MB) and the host scans
+ * out from offset 0 as soon as SVGA_REG_ENABLE=1.  We modeset to the
+ * tunable want_width x want_height x want_bpp, then paint a 4-colour
+ * quadrant pattern straight into BAR2:
+ *
+ *     +----------+----------+
+ *     | red      | green    |
+ *     +----------+----------+
+ *     | blue     | white    |
+ *     +----------+----------+
+ *
+ * If the Fusion window paints the pattern, vmsvga_drm has reached the
+ * "visible pixels" milestone on FreeBSD/arm64.
+ */
+static int
+vmsvga_sysctl_test_pattern(SYSCTL_HANDLER_ARGS)
+{
+	struct vmsvga_softc *sc = arg1;
+	bus_space_tag_t bst;
+	bus_space_handle_t bsh;
+	uint32_t w, h, stride;
+	uint32_t x, y, c;
+	int val = 0, err;
+
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (val != 1)
+		return (EINVAL);
+	if (sc->fb_res == NULL)
+		return (ENXIO);
+
+	err = vmsvga_set_mode(sc, sc->want_width, sc->want_height, 32);
+	if (err != 0)
+		return (err);
+
+	w = sc->cur_width;
+	h = sc->cur_height;
+	stride = sc->cur_bytes_per_line;
+	if (w == 0 || h == 0 || stride < w * 4)
+		return (EIO);
+	if ((bus_size_t)stride * h > sc->fb_size) {
+		device_printf(sc->dev,
+		    "test_pattern: mode %ux%u stride=%u exceeds fb_size=%ju\n",
+		    w, h, stride, (uintmax_t)sc->fb_size);
+		return (E2BIG);
+	}
+
+	bst = rman_get_bustag(sc->fb_res);
+	bsh = rman_get_bushandle(sc->fb_res);
+
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			if (y < h / 2) {
+				c = (x < w / 2) ? 0x00ff0000u    /* red   */
+				                : 0x0000ff00u;   /* green */
+			} else {
+				c = (x < w / 2) ? 0x000000ffu    /* blue  */
+				                : 0x00ffffffu;   /* white */
+			}
+			bus_space_write_4(bst, bsh,
+			    (bus_size_t)y * stride + x * 4, c);
+		}
+	}
+
+	device_printf(sc->dev,
+	    "test_pattern: painted %ux%u@32bpp stride=%u into BAR2\n",
+	    w, h, stride);
+	return (0);
+}
+
+/*
  * Phase D probe: try to negotiate a guest-allocated FIFO with the
  * host.  Classic SVGA-II expects host-provided FIFO base via
  * SVGA_REG_MEM_START -- but VBox arm64 reports MEM_START=0 even
@@ -1529,6 +1603,11 @@ vmsvga_sysctl_setup(struct vmsvga_softc *sc)
 	    "SVGA_REG_MEM_START, init FIFO header, set CONFIG_DONE=1, "
 	    "emit one SVGA_CMD_UPDATE.  Gated -- panic risk if host "
 	    "rejects guest-allocated FIFO.");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "test_pattern",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    vmsvga_sysctl_test_pattern, "I",
+	    "Modeset to want_*x32bpp and paint a four-quadrant colour "
+	    "pattern into the VRAM BAR.  First-pixels probe.");
 }
 
 static int
